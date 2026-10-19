@@ -763,6 +763,20 @@ $JS_TO_MD = @'
       if (n.nodeType !== 1) continue;
       const t = n.tagName.toLowerCase();
       if (t === 'br') { out += '\n'; continue; }
+      // 公式：优先用 data-math 属性还原 TeX（KaTeX 的 MathML/HTML 双层会重复文本）
+      const mathTex = n.getAttribute && n.getAttribute('data-math');
+      if (mathTex && mathTex.indexOf('$') < 0) {
+        const block = n.classList && n.classList.contains('math-block');
+        out += (block ? '$$' : '$') + mathTex.trim() + (block ? '$$' : '$');
+        continue;
+      }
+      if (n.classList && n.classList.contains('katex')) {
+        const khtml = n.querySelector('.katex-html');
+        const vis = ((khtml ? khtml.textContent : n.textContent) || '').trim();
+        if (vis) out += '$' + vis + '$';
+        continue;
+      }
+      if (n.classList && n.classList.contains('katex-mathml')) { continue; }
       if (t === 'code') { out += '`' + n.textContent.replace(/`/g, '\\`') + '`'; continue; }
       if (t === 'strong' || t === 'b') { out += '**' + inline(n).trim() + '**'; continue; }
       if (t === 'em' || t === 'i') { out += '*' + inline(n).trim() + '*'; continue; }
@@ -1373,7 +1387,14 @@ while ((Get-Date) -lt $deadline) {
       $len = if ($md) { $md.Length } else { 0 }
       if ($len -gt 0 -and $len -eq $lastLen) {
         $stableCount++
-        if ($stableCount -ge 2) { $script:Answer = $md; break }
+        if ($stableCount -ge 3) {
+          # 交叉确认：再等一轮并复查长度与生成指示，防止生成中途 stop 短暂消失导致截断
+          Start-Sleep -Milliseconds 1500
+          $md2 = Get-LastAnswerMarkdown $WB_SESSION
+          $stc = Get-PageState $WB_SESSION
+          if ($md2 -and $md2.Length -ge $len -and $stc -and -not $stc.stop) { $script:Answer = $md2; break }
+          $stableCount = 0
+        }
       } else { $stableCount = 0 }
       $lastLen = $len
     }
