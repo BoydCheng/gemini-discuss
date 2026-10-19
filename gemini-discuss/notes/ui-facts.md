@@ -57,6 +57,7 @@
 | 代码语言 | 代码块头部 `div.code-block-decoration span`（如 `C`）；正文 `pre > code[data-test-id=code-content]` |
 | 思考过程 | DOM 中存在 thought 相关元素；未抓取（v1 不需要） |
 | 实测耗时 | 简单结构化问答（表格+代码，400字内）：~5 秒；追问一句话：~5-15 秒 |
+| 后台等待 | 发送成功后最小化窗口：回答仍会写入 DOM 并完成（2026-10-19 实测）→ 等待期无需前台、无需激活 |
 
 ## 5. 侧栏与会话列表（-ListChats / -Attach 依据）
 

@@ -877,16 +877,21 @@ function Get-LocalAnchorMap {
   return $map
 }
 function Wait-SidebarChats {
-  # 侧栏会话列表是异步水合的：轮询直到出现条目或超时（保持窗口可见）
+  # 侧栏会话列表是异步水合的：轮询直到出现条目或超时。
+  # 最小打扰：每 ~10s 才检查一次可见性，且只做软激活（不最小化/还原）。
   param([string]$SessionName, [int]$Seconds = 35, [int]$MinCount = 1)
   $dl = (Get-Date).AddSeconds($Seconds)
   $last = @()
+  $loopN = 0
   while ((Get-Date) -lt $dl) {
     $last = Get-SidebarChats -SessionName $SessionName -LimitN 60
     if (@($last).Count -ge $MinCount) { return $last }
     Start-Sleep -Milliseconds 2000
-    $st = Get-PageState $SessionName
-    if ($st -and ($st.vis -ne 'visible' -or -not $st.focus)) { [void](Force-ActivateBrowser -Nuke -WbSession $SessionName) }
+    $loopN++
+    if ($loopN % 5 -eq 0) {
+      $st = Get-PageState $SessionName
+      if ($st -and ($st.vis -ne 'visible' -or -not $st.focus)) { [void](Force-ActivateBrowser -WbSession $SessionName) }
+    }
   }
   return $last
 }
@@ -1332,17 +1337,24 @@ $baseUq = if ($stWait) { [int]$stWait.uq } else { 1 }
 $script:Answer = $null
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $tStart = Get-Date
-$lastLen = -1; $stableCount = 0; $iter = 0; $lastAct = Get-Date
+$lastLen = -1; $stableCount = 0; $iter = 0
+# 等待期最小打扰（2026-10-19 实测：窗口最小化后回答仍会写入 DOM）
+# → 默认不抢焦点；仅当连续 120s 完全没有进展时才轻激活一次（最多 2 次）
+$lastProgress = Get-Date
+$lastMr = if ($stWait) { [int]$stWait.mr } else { 0 }
+$stallNudges = 0
 while ((Get-Date) -lt $deadline) {
   $iter++
   Start-Sleep -Milliseconds 2200
-  if (((Get-Date) - $lastAct).TotalSeconds -gt 15) {
-    $lastAct = Get-Date
-    $stv = Get-PageState $WB_SESSION
-    if ($stv -and ($stv.vis -ne 'visible' -or -not $stv.focus)) { [void](Force-ActivateBrowser) }
-  }
   $st = Get-PageState $WB_SESSION
   if (-not $st) { continue }
+  if ([int]$st.mr -ne $lastMr) { $lastMr = [int]$st.mr; $lastProgress = Get-Date }
+  if (((Get-Date) - $lastProgress).TotalSeconds -gt 120 -and $stallNudges -lt 2) {
+    $stallNudges++
+    Write-Warning "等待生成超过 120s 无进展，轻激活一次以刷新渲染（第 $stallNudges 次）"
+    [void](Force-ActivateBrowser)
+    $lastProgress = Get-Date
+  }
   if ([int]$st.mr -ge [int]$st.uq -and [int]$st.uq -ge 1) {
     if (-not $st.stop) {
       $md = Get-LastAnswerMarkdown $WB_SESSION
