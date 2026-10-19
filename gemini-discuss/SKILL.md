@@ -198,7 +198,7 @@ pwsh -File ...\ask-gemini.ps1 -Attach <conversationId> -Session rigol-perf
 
 ## 答案读取与完成判定（机制说明）
 
-- 回答 = 最后一个 `model-response` 的 `.markdown` 子树 → **DOM→Markdown 重建**（`| 表格 |`、``` 代码块```、列表、加粗；代码块语言取自 `code-block-decoration`）
+- 回答 = 最后一个 `model-response` 的 `.markdown` 子树 → **DOM→Markdown 重建**（`| 表格 |`、``` 代码块```、列表、加粗；代码块语言取自 `code-block-decoration`；公式优先取 `data-math` 还原为 `$…$`，避免 KaTeX 双层文本重复）
 - 完成判定 = 新回答出现（`model-response` 数 ≥ `user-query` 数）且文本长度连续两次一致且停止按钮消失
 - 超时兜底只在"本轮确有回答"时才读取（防止把上一轮答案误当本轮）
 
@@ -223,4 +223,7 @@ pwsh -File "<skill>\tools\verify-docs.ps1" -Roots <项目根>
 - **需简体中文界面**；英文界面暂未适配
 - **后台运行限制**：页面加载与交互需要"可见"；发送后的等待阶段可以后台
 - 模式复核是尽力而为：会话页在隐藏态加载时选择器可能不渲染 → 脚本沿用记录值并告警（会话创建时已确保过模式，且 Gemini 会话保持其自身模式）
+- 新版 UI 下模式可能"已切换但选择器文本不刷新"（切换 RPC 200，picker 仍显示旧值）→ 告警 `模式确认: 未校验`，问答不受影响；详见 `notes\ui-facts.md`
+- **免费账号（无 Pro）会自动跳过模式设置**：页面存在可见「升级」入口时脚本判定为免费档，不再尝试切换 `4 Argon`/`高点`（免费档无该权限，切换会静默不生效）
+- 首屏加载慢的环境（冷加载 40s+）首次可能 `exit 5/6`：重跑**同一条**命令即可，脚本页面等待上限已放宽到 90-120s
 - Deep Think 为 Ultra 专属；非 Ultra 账号最深 = `4 Argon + 高点`

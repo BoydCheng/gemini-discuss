@@ -436,6 +436,26 @@ function Get-PageState {
   } catch { return $null }
 }
 
+$JS_TIER = @'
+(() => {
+  const up = document.querySelector('g1-dynamic-upsell-button, .buttons-container.adv-upsell');
+  const visible = up ? (up.getBoundingClientRect().width > 0) : false;
+  return JSON.stringify({ upsell: visible, text: up ? ((up.innerText || '').trim().slice(0, 40)) : null });
+})()
+'@
+function Get-AccountTier {
+  # 免费档判定：页面存在可见的「升级」入口（g1-dynamic-upsell-button / .adv-upsell）
+  # 返回 free（无 Pro，跳过模型选择）| paid（假定可设置）| unknown（读取失败，按 paid 处理）
+  param([string]$SessionName)
+  try {
+    $v = Eval-JS $JS_TIER $SessionName
+    if (-not $v) { return 'unknown' }
+    $o = $v | ConvertFrom-Json
+    if ($o.upsell) { return 'free' }
+    return 'paid'
+  } catch { return 'unknown' }
+}
+
 # ---------- 会话标签管理 ----------
 
 function Get-SessionGeminiTabs {
@@ -529,7 +549,7 @@ function Ensure-Account {
   # 自动检测模式：未指定邮箱 → 打开默认账号页，读取浏览器当前登录的 Gemini 账号
   if (-not $ExpectEmail) {
     Reload-Visible $SessionName (Get-HomeUrl -1) -Group $Group
-    $stDef = Wait-PageReady $SessionName 35
+    $stDef = Wait-PageReady $SessionName 90
     if ($stDef -and $stDef.email) {
       $idxDef = -1
       $md = [regex]::Match([string]$stDef.url, 'gemini\.google\.com/u/(\d+)/app')
@@ -547,12 +567,12 @@ function Ensure-Account {
       return @{ index = $n; email = $st.email }
     }
     Reload-Visible $SessionName (Get-HomeUrl $n) -Group $Group
-    $st = Wait-PageReady $SessionName 25
+    $st = Wait-PageReady $SessionName 60
     if ($st -and $st.email -eq $ExpectEmail) { return @{ index = $n; email = $st.email } }
   }
   # 兜底：默认账号页（不带 /u/N 前缀，账号可能只在默认页可见）
   Reload-Visible $SessionName (Get-HomeUrl -1) -Group $Group
-  $stFallback = Wait-PageReady $SessionName 30
+  $stFallback = Wait-PageReady $SessionName 90
   if ($stFallback -and $stFallback.email -eq $ExpectEmail) {
     $idxFb = -1
     $mf = [regex]::Match([string]$stFallback.url, 'gemini\.google\.com/u/(\d+)/app')
@@ -617,15 +637,29 @@ function Test-MenuOpen {
   } catch { return $false }
 }
 function Open-ModePicker {
-  param([string]$SessionName)
+  param([string]$SessionName, [int]$WaitSec = 20)
+  # 慢环境下菜单渲染可能需 10s+：每次点击后做有界轮询，而不是固定短等待
   for ($i = 0; $i -lt 3; $i++) {
     if (Test-MenuOpen $SessionName) { return $true }
     try { Invoke-WB "click" @{ selector = "button.input-area-switch" } $SessionName | Out-Null } catch {}
-    Start-Sleep -Milliseconds 1300
-    if (Test-MenuOpen $SessionName) { return $true }
-    Start-Sleep -Milliseconds 600
+    $deadline = (Get-Date).AddSeconds($WaitSec)
+    while ((Get-Date) -lt $deadline) {
+      Start-Sleep -Milliseconds 800
+      if (Test-MenuOpen $SessionName) { return $true }
+    }
   }
   return $false
+}
+function Wait-PickerLabel {
+  # Enter 后模式选择器标签可能有延迟；有界轮询直到出现目标关键字
+  param([string]$SessionName, [string]$Key, [int]$Seconds = 8)
+  $deadline = (Get-Date).AddSeconds($Seconds)
+  while ((Get-Date) -lt $deadline) {
+    $st = Get-PageState $SessionName
+    if ($st -and $st.picker -and (($st.picker -replace '\s', '') -like "*$Key*")) { return $st }
+    Start-Sleep -Milliseconds 600
+  }
+  return (Get-PageState $SessionName)
 }
 function Close-ModePicker {
   param([string]$SessionName)
@@ -666,9 +700,8 @@ function Set-ModelPreference {
     return $null
   }
   Send-Enter $SessionName
-  Start-Sleep -Milliseconds 900
-  $st = Get-PageState $SessionName
   $key = ($target -replace '^\d+(\.\d+)?\s*', '')
+  $st = Wait-PickerLabel $SessionName $key 8
   if ($st -and $st.picker -and (($st.picker -replace '\s', '') -like "*$key*")) { return $target }
   Write-Warning "模型设置后校验不通过（picker=$($st.picker)）"
   return $null
@@ -706,8 +739,7 @@ function Set-ThinkingPreference {
     return $null
   }
   Send-Enter $SessionName
-  Start-Sleep -Milliseconds 900
-  $st = Get-PageState $SessionName
+  $st = Wait-PickerLabel $SessionName ($target -replace '\s', '') 8
   if ($st -and $st.picker -and (($st.picker -replace '\s', '') -like "*$($target -replace '\s','')*")) { return $target }
   Write-Warning "思考档设置后校验不通过（picker=$($st.picker)）"
   return $null
@@ -751,6 +783,20 @@ $JS_TO_MD = @'
       if (n.nodeType !== 1) continue;
       const t = n.tagName.toLowerCase();
       if (t === 'br') { out += '\n'; continue; }
+      // 公式：优先用 data-math 属性还原 TeX（KaTeX 的 MathML/HTML 双层会重复文本）
+      const mathTex = n.getAttribute && n.getAttribute('data-math');
+      if (mathTex && mathTex.indexOf('$') < 0) {
+        const block = n.classList && n.classList.contains('math-block');
+        out += (block ? '$$' : '$') + mathTex.trim() + (block ? '$$' : '$');
+        continue;
+      }
+      if (n.classList && n.classList.contains('katex')) {
+        const khtml = n.querySelector('.katex-html');
+        const vis = ((khtml ? khtml.textContent : n.textContent) || '').trim();
+        if (vis) out += '$' + vis + '$';
+        continue;
+      }
+      if (n.classList && n.classList.contains('katex-mathml')) { continue; }
       if (t === 'code') { out += '`' + n.textContent.replace(/`/g, '\\`') + '`'; continue; }
       if (t === 'strong' || t === 'b') { out += '**' + inline(n).trim() + '**'; continue; }
       if (t === 'em' || t === 'i') { out += '*' + inline(n).trim() + '*'; continue; }
@@ -996,13 +1042,13 @@ if ($ListChats) {
   [void](Force-ActivateBrowser -Nuke -WbSession $SCAN_SESSION)
   $acctL = Ensure-Account -SessionName $SCAN_SESSION -AcctIndex $acctIndex -ExpectEmail $Account -Group "Gemini讨论：会话浏览"
   if (-not $acctL) { Fail 14 "浏览器里找不到目标账号（已扫描 u/0..u/4 与默认账号页）。请先在浏览器登录 Google 账号。" }
-  [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 30)
+  [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 90)
   if (-not (Ensure-SidebarOpen -SessionName $SCAN_SESSION)) { Write-Warning "侧栏未确认打开，仍尝试读取…" }
   $chats = Wait-SidebarChats -SessionName $SCAN_SESSION -Seconds 35 -MinCount 1
   if (@($chats).Count -eq 0) {
     Write-Warning "侧栏列表为空（可能水合未完成），可见重载后重试…"
     Reload-Visible $SCAN_SESSION (Get-HomeUrl $acctL.index) -Group "Gemini讨论：会话浏览"
-    [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 30)
+    [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 90)
     [void](Ensure-SidebarOpen -SessionName $SCAN_SESSION)
     $chats = Wait-SidebarChats -SessionName $SCAN_SESSION -Seconds 50 -MinCount 1
   }
@@ -1034,13 +1080,13 @@ if ($Attach) {
     $acctA = Ensure-Account -SessionName $SCAN_SESSION -AcctIndex $acctIndex -ExpectEmail $Account -Group "Gemini讨论：会话浏览"
     if (-not $acctA) { Fail 14 "浏览器里找不到目标账号（已扫描 u/0..u/4 与默认账号页）。" }
     $acctIndex = [int]$acctA.index
-    [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 30)
+    [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 90)
     [void](Ensure-SidebarOpen -SessionName $SCAN_SESSION)
     $chats = Wait-SidebarChats -SessionName $SCAN_SESSION -Seconds 35 -MinCount 1
     if (@($chats).Count -eq 0) {
       Write-Warning "侧栏列表为空（可能水合未完成），可见重载后重试…"
       Reload-Visible $SCAN_SESSION (Get-HomeUrl $acctIndex) -Group "Gemini讨论：会话浏览"
-      [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 30)
+      [void](Wait-PageReady -SessionName $SCAN_SESSION -Seconds 90)
       [void](Ensure-SidebarOpen -SessionName $SCAN_SESSION)
       $chats = Wait-SidebarChats -SessionName $SCAN_SESSION -Seconds 50 -MinCount 1
     }
@@ -1168,14 +1214,14 @@ if ($script:ConvUrl -and $script:ConvUrl -notmatch '/u/\d+/') {
 if ($creating) {
   Write-Warning "打开 Gemini 新对话（/u/$acctIndex/app）"
   Reload-Visible $WB_SESSION (Get-HomeUrl $acctIndex) -Group $GroupTitle
-  $st = Wait-PageReady -SessionName $WB_SESSION -Seconds 40
+  $st = Wait-PageReady -SessionName $WB_SESSION -Seconds 120
   if (-not $st -or -not $st.ed) { Fail 5 "Gemini 新对话页未就绪（40s 内没看到输入框）——可能是登录墙/加载失败/改版" }
   # 确保从零态开始（若恢复了上次会话，点“发起新对话”）
   if ($st.uq -gt 0) {
     Write-Warning "页面非零态，点击「发起新对话」"
     try { Invoke-WB "click" @{ selector = "a[aria-label=`"发起新对话`"], a[href$=`"/app`"]" } $WB_SESSION | Out-Null } catch {}
     Start-Sleep -Seconds 2
-    [void](Wait-PageReady -SessionName $WB_SESSION -Seconds 20)
+    [void](Wait-PageReady -SessionName $WB_SESSION -Seconds 60)
   }
 } else {
   $convId = Get-ConvId $anchor
@@ -1189,11 +1235,11 @@ if ($creating) {
     }
   }
   # 就绪检测：已有会话应能看到历史消息（uq>=1）；否则可见重载一次
-  $st = Wait-PageReady -SessionName $WB_SESSION -Seconds 35 -MinUq 1
+  $st = Wait-PageReady -SessionName $WB_SESSION -Seconds 90 -MinUq 1
   if (-not $st -or [int]$st.uq -lt 1) {
     Write-Warning "会话内容未渲染（Gemini 后台加载降级态），执行可见重载…"
     Reload-Visible $WB_SESSION $anchor -Group $GroupTitle
-    $st = Wait-PageReady -SessionName $WB_SESSION -Seconds 45 -MinUq 1
+    $st = Wait-PageReady -SessionName $WB_SESSION -Seconds 120 -MinUq 1
   }
   if (-not $st -or -not $st.ed) { Fail 5 "Gemini 页面未就绪（会话页加载失败）" }
   if ([int]$st.uq -lt 1) { Fail 6 "锚定会话 $anchor 打开后看不到任何消息（可能账号不符/会话被删）" }
@@ -1230,20 +1276,28 @@ if (-not $creating) {
 # 说明：会话页在隐藏态加载时可能不渲染模式选择器（可见才渲染家族）→ 短等待 + 沿用记录值
 [void](Wait-PickerState $WB_SESSION 8)
 $modeActual = $null
-$modelActual = Set-ModelPreference $WB_SESSION
-$thinkingActual = Set-ThinkingPreference $WB_SESSION
-if ($modelActual -and $thinkingActual) { $modeActual = "$modelActual $thinkingActual" }
-elseif ($modelActual) { $modeActual = $modelActual }
-elseif ($thinkingActual) { $modeActual = $thinkingActual }
-if (-not $modeActual) {
-  $stNow = Get-PageState $WB_SESSION
-  if ($stNow -and $stNow.picker) {
-    $modeActual = ($stNow.picker -replace '\s', '')
-  } elseif ($state -and $state.mode -and $state.mode -ne '未校验') {
-    $modeActual = "$($state.mode)"
-    Write-Warning "本轮未能复核模式（选择器未渲染），沿用记录值: $modeActual"
-  } else {
-    $modeActual = "未校验"
+$acctTier = Get-AccountTier $WB_SESSION
+if ($acctTier -eq 'free') {
+  # 免费档没有 Pro 模型权限：切换请求会被服务端接受但选择器不生效，直接跳过避免无谓操作
+  Write-Warning "账号为免费档（页面存在升级入口），跳过模型/思考档设置"
+  $stTier = Get-PageState $WB_SESSION
+  $modeActual = if ($stTier -and $stTier.picker) { ($stTier.picker -replace '\s', '') } else { '账号默认（免费档）' }
+} else {
+  $modelActual = Set-ModelPreference $WB_SESSION
+  $thinkingActual = Set-ThinkingPreference $WB_SESSION
+  if ($modelActual -and $thinkingActual) { $modeActual = "$modelActual $thinkingActual" }
+  elseif ($modelActual) { $modeActual = $modelActual }
+  elseif ($thinkingActual) { $modeActual = $thinkingActual }
+  if (-not $modeActual) {
+    $stNow = Get-PageState $WB_SESSION
+    if ($stNow -and $stNow.picker) {
+      $modeActual = ($stNow.picker -replace '\s', '')
+    } elseif ($state -and $state.mode -and $state.mode -ne '未校验') {
+      $modeActual = "$($state.mode)"
+      Write-Warning "本轮未能复核模式（选择器未渲染），沿用记录值: $modeActual"
+    } else {
+      $modeActual = "未校验"
+    }
   }
 }
 Write-Warning "模式确认: $modeActual"
@@ -1361,7 +1415,14 @@ while ((Get-Date) -lt $deadline) {
       $len = if ($md) { $md.Length } else { 0 }
       if ($len -gt 0 -and $len -eq $lastLen) {
         $stableCount++
-        if ($stableCount -ge 2) { $script:Answer = $md; break }
+        if ($stableCount -ge 3) {
+          # 交叉确认：再等一轮并复查长度与生成指示，防止生成中途 stop 短暂消失导致截断
+          Start-Sleep -Milliseconds 1500
+          $md2 = Get-LastAnswerMarkdown $WB_SESSION
+          $stc = Get-PageState $WB_SESSION
+          if ($md2 -and $md2.Length -ge $len -and $stc -and -not $stc.stop) { $script:Answer = $md2; break }
+          $stableCount = 0
+        }
       } else { $stableCount = 0 }
       $lastLen = $len
     }
