@@ -436,6 +436,26 @@ function Get-PageState {
   } catch { return $null }
 }
 
+$JS_TIER = @'
+(() => {
+  const up = document.querySelector('g1-dynamic-upsell-button, .buttons-container.adv-upsell');
+  const visible = up ? (up.getBoundingClientRect().width > 0) : false;
+  return JSON.stringify({ upsell: visible, text: up ? ((up.innerText || '').trim().slice(0, 40)) : null });
+})()
+'@
+function Get-AccountTier {
+  # 免费档判定：页面存在可见的「升级」入口（g1-dynamic-upsell-button / .adv-upsell）
+  # 返回 free（无 Pro，跳过模型选择）| paid（假定可设置）| unknown（读取失败，按 paid 处理）
+  param([string]$SessionName)
+  try {
+    $v = Eval-JS $JS_TIER $SessionName
+    if (-not $v) { return 'unknown' }
+    $o = $v | ConvertFrom-Json
+    if ($o.upsell) { return 'free' }
+    return 'paid'
+  } catch { return 'unknown' }
+}
+
 # ---------- 会话标签管理 ----------
 
 function Get-SessionGeminiTabs {
@@ -1256,20 +1276,28 @@ if (-not $creating) {
 # 说明：会话页在隐藏态加载时可能不渲染模式选择器（可见才渲染家族）→ 短等待 + 沿用记录值
 [void](Wait-PickerState $WB_SESSION 8)
 $modeActual = $null
-$modelActual = Set-ModelPreference $WB_SESSION
-$thinkingActual = Set-ThinkingPreference $WB_SESSION
-if ($modelActual -and $thinkingActual) { $modeActual = "$modelActual $thinkingActual" }
-elseif ($modelActual) { $modeActual = $modelActual }
-elseif ($thinkingActual) { $modeActual = $thinkingActual }
-if (-not $modeActual) {
-  $stNow = Get-PageState $WB_SESSION
-  if ($stNow -and $stNow.picker) {
-    $modeActual = ($stNow.picker -replace '\s', '')
-  } elseif ($state -and $state.mode -and $state.mode -ne '未校验') {
-    $modeActual = "$($state.mode)"
-    Write-Warning "本轮未能复核模式（选择器未渲染），沿用记录值: $modeActual"
-  } else {
-    $modeActual = "未校验"
+$acctTier = Get-AccountTier $WB_SESSION
+if ($acctTier -eq 'free') {
+  # 免费档没有 Pro 模型权限：切换请求会被服务端接受但选择器不生效，直接跳过避免无谓操作
+  Write-Warning "账号为免费档（页面存在升级入口），跳过模型/思考档设置"
+  $stTier = Get-PageState $WB_SESSION
+  $modeActual = if ($stTier -and $stTier.picker) { ($stTier.picker -replace '\s', '') } else { '账号默认（免费档）' }
+} else {
+  $modelActual = Set-ModelPreference $WB_SESSION
+  $thinkingActual = Set-ThinkingPreference $WB_SESSION
+  if ($modelActual -and $thinkingActual) { $modeActual = "$modelActual $thinkingActual" }
+  elseif ($modelActual) { $modeActual = $modelActual }
+  elseif ($thinkingActual) { $modeActual = $thinkingActual }
+  if (-not $modeActual) {
+    $stNow = Get-PageState $WB_SESSION
+    if ($stNow -and $stNow.picker) {
+      $modeActual = ($stNow.picker -replace '\s', '')
+    } elseif ($state -and $state.mode -and $state.mode -ne '未校验') {
+      $modeActual = "$($state.mode)"
+      Write-Warning "本轮未能复核模式（选择器未渲染），沿用记录值: $modeActual"
+    } else {
+      $modeActual = "未校验"
+    }
   }
 }
 Write-Warning "模式确认: $modeActual"
